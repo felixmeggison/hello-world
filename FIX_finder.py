@@ -1,28 +1,41 @@
 #!/usr/bin/env python3
+"""
+Per-host nmap scanner for ports 10000–12000 that:
+- Scans ONE host at a time (resilient to interruptions)
+- Saves full nmap output for each host in all formats (-oA)
+- Builds a CSV summary with host, fix flag (>= min ports), and open port count/list
+"""
+
 import argparse
 import csv
 import shutil
 import subprocess
 import sys
 import xml.etree.ElementTree as ET
-from tempfile import NamedTemporaryFile
 from pathlib import Path
+
 
 def parse_args():
     p = argparse.ArgumentParser(
-        description="Scan hosts for open ports in a range and flag likely FIX servers."
+        description="Scan hosts (one-per-line) for a port range and flag likely FIX servers (per-host, incremental CSV)."
     )
     p.add_argument("-i", "--input", required=True, help="Path to host list file (one host/IP per line)")
     p.add_argument("-o", "--output", required=True, help="Output CSV path")
+    p.add_argument("--outdir", default="nmap_scans", help="Directory to save raw nmap outputs (default: nmap_scans)")
     p.add_argument("--min-ports", type=int, default=5, help="Threshold to flag as FIX server (default: 5)")
     p.add_argument("--ports", default="10000-12000", help="Port range to scan (default: 10000-12000)")
-    p.add_argument("--extra-nmap-args", default="-T4 -n --open -Pn",
-                   help='Extra nmap args (default: "-T4 -n --open -Pn")')
+    p.add_argument(
+        "--extra-nmap-args",
+        default="-T4 -n --open -Pn",
+        help='Extra nmap args (default: "-T4 -n --open -Pn")',
+    )
     return p.parse_args()
+
 
 def ensure_nmap():
     if shutil.which("nmap") is None:
         sys.exit("ERROR: nmap not found in PATH. Install nmap and try again.")
+
 
 def read_hosts(path):
     hosts = []
@@ -35,32 +48,58 @@ def read_hosts(path):
         sys.exit("ERROR: No hosts found in input.")
     return hosts
 
-def run_nmap(host_file, port_range, extra_args):
-    # Build command: nmap -iL host_file -p <range> <extra_args> -oX -
-    # Use a temporary file for -iL to avoid shell quoting issues if user passed a path with spaces.
-    cmd = ["nmap", "-iL", host_file, "-p", port_range] + extra_args.split() + ["-oX", "-"]
+
+def sanitize_basename(s: str) -> str:
+    # Safe for filenames: replace characters that can appear in IPv6/paths/etc.
+    return s.replace("/", "_").replace("\\", "_").replace(":", "_").replace("*", "_").replace("?", "_").replace("|", "_")
+
+
+def run_nmap_single(host, port_range, extra_args, outdir):
+    """
+    Runs nmap for a single host, writes -oA files to outdir/<host_sanitized>.*
+    Returns the XML text (read back from the generated .xml) for parsing.
+    """
+    Path(outdir).mkdir(parents=True, exist_ok=True)
+    outfile_base = Path(outdir) / sanitize_basename(host)
+    cmd = ["nmap", "-p", port_range] + extra_args.split() + ["-oA", str(outfile_base), host]
+
     try:
         res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
     except Exception as e:
-        sys.exit(f"ERROR: Failed to run nmap: {e}")
-    if res.returncode not in (0, 1):  # 0 OK, 1 some closed/filtered hosts—still usable
+        print(f"ERROR: Failed to run nmap for {host}: {e}", file=sys.stderr)
+        return ""
+
+    if res.returncode not in (0, 1):  # 0 OK; 1 means some issues but output usually usable
         sys.stderr.write(res.stderr)
-        sys.exit(f"ERROR: nmap exited with code {res.returncode}. See stderr above.")
-    return res.stdout
+        print(f"WARNING: nmap exited with code {res.returncode} for host {host}. Continuing.", file=sys.stderr)
+
+    xml_path = f"{outfile_base}.xml"
+    try:
+        return Path(xml_path).read_text(encoding="utf-8")
+    except Exception as e:
+        print(f"WARNING: Could not read XML output for {host}: {e}", file=sys.stderr)
+        return ""
+
 
 def parse_nmap_xml(xml_text):
+    """
+    Parses nmap XML (possibly single-host) and returns a list of rows:
+    { host, hostname, open_ports [ints], open_count }
+    """
     results = []
+    if not xml_text:
+        return results
     try:
         root = ET.fromstring(xml_text)
     except ET.ParseError as e:
-        sys.exit(f"ERROR: Failed parsing nmap XML: {e}")
+        print(f"WARNING: Failed to parse nmap XML: {e}", file=sys.stderr)
+        return results
 
     for h in root.findall("host"):
-        # address
+        # address: prefer ipv4 if present
         addr = None
         for a in h.findall("address"):
             addr = a.attrib.get("addr")
-            # prefer IPv4 if multiple
             if a.attrib.get("addrtype") == "ipv4":
                 addr = a.attrib.get("addr")
                 break
@@ -82,64 +121,68 @@ def parse_nmap_xml(xml_text):
                 if state is not None and state.attrib.get("state") == "open":
                     try:
                         open_ports.append(int(p.attrib.get("portid", "-1")))
-                    except ValueError:
+                    except (ValueError, TypeError):
                         pass
 
-        # Skip hosts with no address (rare)
-        if not addr:
-            continue
-
-        results.append({
-            "host": addr,
-            "hostname": hostname,
-            "open_ports": sorted(open_ports),
-            "open_count": len(open_ports),
-        })
+        if addr:
+            results.append(
+                {
+                    "host": addr,
+                    "hostname": hostname,
+                    "open_ports": sorted(open_ports),
+                    "open_count": len(open_ports),
+                }
+            )
     return results
 
-def write_csv(rows, output_path, min_ports):
-    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
-    with open(output_path, "w", newline="", encoding="utf-8") as f:
-        w = csv.writer(f)
-        w.writerow(["host", "hostname", "is_fix_server", "open_port_count", "open_ports"])
-        for r in rows:
-            is_fix = "yes" if r["open_count"] >= min_ports else "no"
-            w.writerow([
-                r["host"],
-                r["hostname"],
-                is_fix,
-                r["open_count"],
-                " ".join(map(str, r["open_ports"])) if r["open_ports"] else ""
-            ])
 
 def main():
     args = parse_args()
     ensure_nmap()
     hosts = read_hosts(args.input)
 
-    # Write hosts to a clean temp file for -iL
-    with NamedTemporaryFile("w", delete=False, encoding="utf-8") as tf:
-        for h in hosts:
-            tf.write(h + "\n")
-        tmp_hosts_file = tf.name
+    # init CSV header (overwrite each run)
+    Path(args.output).parent.mkdir(parents=True, exist_ok=True)
+    with open(args.output, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["host", "hostname", "is_fix_server", "open_port_count", "open_ports"])
 
-    try:
-        xml_out = run_nmap(tmp_hosts_file, args.ports, args.extra_nmap_args)
-    finally:
-        # Best-effort cleanup
-        try:
-            Path(tmp_hosts_file).unlink(missing_ok=True)
-        except Exception:
-            pass
+    total = 0
+    fixes = 0
 
-    parsed = parse_nmap_xml(xml_out)
-    write_csv(parsed, args.output, args.min_ports)
+    for host in hosts:
+        print(f"[+] Scanning {host} ...")
+        xml_out = run_nmap_single(host, args.ports, args.extra_nmap_args, args.outdir)
+        parsed_rows = parse_nmap_xml(xml_out)
 
-    # Quick summary to stdout
-    total = len(parsed)
-    fixes = sum(1 for r in parsed if r["open_count"] >= args.min_ports)
+        # Try to match exact host; fallback to first parsed row if nmap rewrote address
+        row = next((r for r in parsed_rows if r["host"] == host), None)
+        if not row and parsed_rows:
+            row = parsed_rows[0]
+        if not row:
+            row = {"host": host, "hostname": "", "open_ports": [], "open_count": 0}
+
+        is_fix = "yes" if row["open_count"] >= args.min_ports else "no"
+
+        # Append immediately for resilience
+        with open(args.output, "a", newline="", encoding="utf-8") as f:
+            csv.writer(f).writerow(
+                [
+                    row["host"],
+                    row.get("hostname", ""),
+                    is_fix,
+                    row["open_count"],
+                    " ".join(map(str, row["open_ports"])) if row["open_ports"] else "",
+                ]
+            )
+
+        total += 1
+        fixes += (is_fix == "yes")
+
     print(f"Scanned {total} host(s). Likely FIX servers (≥{args.min_ports} ports in {args.ports}): {fixes}")
     print(f"CSV written to: {args.output}")
+    print(f"Raw nmap outputs per host are in: {args.outdir} ( .nmap / .gnmap / .xml )")
+
 
 if __name__ == "__main__":
     main()
